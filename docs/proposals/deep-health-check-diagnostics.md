@@ -17,206 +17,300 @@ The internal health signals (RPC latency, persistence error ratio, etc.) exist b
 ## Current Flow (Before)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                        CURRENT: Fault Detection Flow                             │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  saas-control-plane                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ MonitorHealthStatus Activity                                               │ │
-│  │                                                                            │ │
-│  │   every 10s:                                                               │ │
-│  │     resp = adminClient.DeepHealthCheck()                                   │ │
-│  │                           │                                                │ │
-│  │                           ▼                                                │ │
-│  │     if resp.State == NOT_SERVING || DECLINED_SERVING:                      │ │
-│  │         consecutiveFailureCount++                                          │ │
-│  │                                                                            │ │
-│  │     if consecutiveFailureCount > threshold:                                │ │
-│  │         return HealthStatusOutage  ───────────────────┐                    │ │
-│  │                                                       │                    │ │
-│  └───────────────────────────────────────────────────────│────────────────────┘ │
-│                                                          │                      │
-│                                                          ▼                      │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ AutoFailoverCluster Workflow                                               │ │
-│  │                                                                            │ │
-│  │   Log: "cellID unhealthy, triggerReason: DeepHealthCheck unhealthy         │ │
-│  │         (NOT_SERVING) count (3) exceeded threshold (3)"                    │ │
-│  │                                     │                                      │ │
-│  │   ❌ No info about:                 │                                      │ │
-│  │      • Which service failed         │                                      │ │
-│  │      • Why it failed                ▼                                      │ │
-│  │      • Actual metrics          Trigger Failover                            │ │
-│  │                                                                            │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                         CURRENT: Fault Detection Flow                             │
 ├──────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  temporal server                                                                 │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ Frontend: AdminHandler.DeepHealthCheck()                                   │ │
-│  │                                                                            │ │
-│  │   hosts = getAllHistoryHosts()                                             │ │
-│  │   for each host:                                                           │ │
-│  │       state = historyClient.DeepHealthCheck(host)  ────┐                   │ │
-│  │                                                        │                   │ │
-│  │   aggregate states into single HealthState             │                   │ │
-│  │                           │                            │                   │ │
-│  │                           ▼                            │                   │ │
-│  │   return DeepHealthCheckResponse{                      │                   │ │
-│  │       State: SERVING | NOT_SERVING | DECLINED_SERVING  │                   │ │
-│  │   }                                                    │                   │ │
-│  │   ❌ Per-host details discarded                        │                   │ │
-│  │   ❌ Failure reasons discarded                         │                   │ │
-│  │                                                        │                   │ │
-│  └────────────────────────────────────────────────────────│───────────────────┘ │
-│                                                           │                     │
-│  ┌────────────────────────────────────────────────────────│───────────────────┐ │
-│  │ History: Handler.DeepHealthCheck()                     ▼                   │ │
-│  │                                                                            │ │
-│  │   // Check 1: gRPC health (graceful shutdown)                              │ │
-│  │   if grpcHealth != SERVING:                                                │ │
-│  │       return DECLINED_SERVING  ❌ reason lost                              │ │
-│  │                                                                            │ │
-│  │   // Check 2: RPC latency                                                  │ │
-│  │   if rpcLatency > threshold:                                               │ │
-│  │       return NOT_SERVING  ❌ latency value lost                            │ │
-│  │                                                                            │ │
-│  │   // Check 3: RPC error ratio                                              │ │
-│  │   if rpcErrorRatio > threshold:                                            │ │
-│  │       return NOT_SERVING  ❌ error ratio lost                              │ │
-│  │                                                                            │ │
-│  │   // Check 4: Persistence latency                                          │ │
-│  │   if persistenceLatency > threshold:                                       │ │
-│  │       return NOT_SERVING  ❌ latency value lost                            │ │
-│  │                                                                            │ │
-│  │   // Check 5: Persistence error ratio                                      │ │
-│  │   if persistenceErrorRatio > threshold:                                    │ │
-│  │       return NOT_SERVING  ❌ error ratio lost                              │ │
-│  │                                                                            │ │
-│  │   return SERVING                                                           │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+│                                                                                   │
+│  saas-control-plane                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Activities.MonitorHealthStatus()                                             │  │
+│  │ [internal/workflows/temporal/activities.go:1577]                             │  │
+│  │                                                                              │  │
+│  │   every CheckIntervalInSeconds (default 10s):                               │  │
+│  │     resp, err = adminClient.DeepHealthCheck(ctx, &DeepHealthCheckRequest{})  │  │
+│  │     [activities.go:1617]                                                     │  │
+│  │                           │                                                  │  │
+│  │                           ▼                                                  │  │
+│  │     if err != nil:                                                           │  │
+│  │       if isConnectionFailure(err): serverConnectionErrorCount++             │  │
+│  │       [activities.go:1627-1628]                                              │  │
+│  │                                                                              │  │
+│  │     if resp.State == NOT_SERVING || DECLINED_SERVING:                       │  │
+│  │       consecutiveFailureCount++  [activities.go:1637]                       │  │
+│  │     else if resp.State == SERVING:                                           │  │
+│  │       consecutiveFailureCount = 0; serverConnectionErrorCount = 0           │  │
+│  │                                                                              │  │
+│  │     if input.CheckCanaryConnection:                                         │  │
+│  │       err = a.describeCanaryNamespace(clusterID, region, logger)            │  │
+│  │       [activities.go:1651]                                                   │  │
+│  │       if errCanaryConnection: canaryConnectionErrorCount++                  │  │
+│  │                                                                              │  │
+│  │     if consecutiveFailureCount > MaxFailureCount                            │  │
+│  │        || serverConnectionErrorCount > MaxConnectionFailureCount            │  │
+│  │        || canaryConnectionErrorCount > MaxFailureCount:                     │  │
+│  │       return MonitorHealthStatusOutput{                                      │  │
+│  │         HealthStatus: HealthStatusOutage,                                    │  │
+│  │         FailureDetails: &MonitorHealthStatusFailureDetails{...}             │  │
+│  │       }  ────────────────────────────────────────────┐                      │  │
+│  └──────────────────────────────────────────────────────│──────────────────────┘  │
+│                                                          │                        │
+│                                                          ▼                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Workflows.AutoFailoverCluster()                                             │  │
+│  │ [internal/workflows/xdc/fault_detection.go:137]                             │  │
+│  │                                                                              │  │
+│  │   Log: "cellID unhealthy, triggerReason: DeepHealthCheck unhealthy          │  │
+│  │         (NOT_SERVING) count (3) exceeded threshold (3)"                     │  │
+│  │                                     │                                        │  │
+│  │   ❌ No info about:                 │                                        │  │
+│  │      • Which service failed         │                                        │  │
+│  │      • Why it failed                ▼                                        │  │
+│  │      • Actual metrics          Trigger Failover                              │  │
+│  │                                                                              │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                   │
+├───────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                   │
+│  temporal server                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │ AdminHandler.DeepHealthCheck()                                              │  │
+│  │ [service/frontend/admin_handler.go:260]                                     │  │
+│  │                                                                              │  │
+│  │   healthStatus, err = adh.historyHealthChecker.Check(ctx)                   │  │
+│  │   [admin_handler.go:266]                                                     │  │
+│  │                           │                                                  │  │
+│  │                           ▼                                                  │  │
+│  │   return &DeepHealthCheckResponse{State: healthStatus}                      │  │
+│  │   [admin_handler.go:270]                                                     │  │
+│  │   ❌ Per-host details discarded                                              │  │
+│  │   ❌ Failure reasons discarded                                               │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                           │                                                       │
+│                           ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │ healthCheckerImpl.Check()                                                   │  │
+│  │ [service/frontend/health_check.go:48]                                       │  │
+│  │                                                                              │  │
+│  │   resolver, err = h.membershipMonitor.GetResolver(h.serviceName)            │  │
+│  │   [health_check.go:49]                                                       │  │
+│  │                                                                              │  │
+│  │   hosts = resolver.AvailableMembers()                                       │  │
+│  │   [health_check.go:54]                                                       │  │
+│  │                                                                              │  │
+│  │   for each host (in parallel goroutines):                                   │  │
+│  │     resp, err = h.healthCheckFn(ctx, host.GetAddress())                     │  │
+│  │     [health_check.go:62]                                                     │  │
+│  │     └── healthCheckFn is a closure set in NewAdminHandler():                │  │
+│  │         args.HistoryClient.DeepHealthCheck(ctx,                              │  │
+│  │           &DeepHealthCheckRequest{HostAddress: hostAddress})                 │  │
+│  │         [admin_handler.go:178]                                               │  │
+│  │                           │                                                  │  │
+│  │                           ▼                                                  │  │
+│  │   Aggregate results:     [health_check.go:73-101]                           │  │
+│  │     failedHostCount / totalHosts + declinedCount / totalHosts               │  │
+│  │       > hostFailurePercentage (0.50)? → NOT_SERVING                         │  │
+│  │     declinedCount / totalHosts                                              │  │
+│  │       > ensureMinimumProportionOfHosts(0.05, totalHosts)? → DECLINED        │  │
+│  │     otherwise → SERVING                                                     │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                           │                                                       │
+│                           ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Handler.DeepHealthCheck()  (per history host)                               │  │
+│  │ [service/history/handler.go:197]                                            │  │
+│  │                                                                              │  │
+│  │   // Check 1: gRPC health (graceful shutdown / hysteresis)                  │  │
+│  │   status, err = h.healthServer.Check(ctx, &HealthCheckRequest{...})         │  │
+│  │   [handler.go:202]                                                           │  │
+│  │   if status.Status != SERVING:                                              │  │
+│  │     return DECLINED_SERVING  ❌ reason lost                                 │  │
+│  │                                                                              │  │
+│  │   // Checks 2-3: History RPC health signals                                 │  │
+│  │   rsp = h.checkHistoryHealthSignals()                                       │  │
+│  │   [handler.go:211]                                                           │  │
+│  │                                                                              │  │
+│  │     // Check 2: h.historyHealthSignal.AverageLatency()                      │  │
+│  │     //   > h.config.HealthRPCLatencyFailure() (500ms)                       │  │
+│  │     //   [handler.go:230]                                                    │  │
+│  │     //   → NOT_SERVING  ❌ latency value lost                               │  │
+│  │                                                                              │  │
+│  │     // Check 3: h.historyHealthSignal.ErrorRatio()                          │  │
+│  │     //   > h.config.HealthRPCErrorRatio() (0.90)                            │  │
+│  │     //   [handler.go:236]                                                    │  │
+│  │     //   → NOT_SERVING  ❌ error ratio lost                                 │  │
+│  │                                                                              │  │
+│  │   // Check 4: Persistence latency                                           │  │
+│  │   h.persistenceHealthSignal.AverageLatency()                                │  │
+│  │     > h.config.HealthPersistenceLatencyFailure() (500ms)                    │  │
+│  │   [handler.go:216-219]                                                       │  │
+│  │     → NOT_SERVING  ❌ latency value lost                                    │  │
+│  │                                                                              │  │
+│  │   // Check 5: Persistence error ratio                                       │  │
+│  │   h.persistenceHealthSignal.ErrorRatio()                                    │  │
+│  │     > h.config.HealthPersistenceErrorRatio() (0.90)                         │  │
+│  │   [handler.go:219]                                                           │  │
+│  │     → NOT_SERVING  ❌ error ratio lost                                      │  │
+│  │                                                                              │  │
+│  │   return SERVING  [handler.go:224]                                          │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+└───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Proposed Flow (After)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                       PROPOSED: Fault Detection Flow                             │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  saas-control-plane                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ MonitorHealthStatus Activity                                               │ │
-│  │                                                                            │ │
-│  │   every 10s:                                                               │ │
-│  │     resp = adminClient.DeepHealthCheck()                                   │ │
-│  │                           │                                                │ │
-│  │                           ▼                                                │ │
-│  │     if resp.State == NOT_SERVING || DECLINED_SERVING:                      │ │
-│  │         consecutiveFailureCount++                                          │ │
-│  │         ✅ Store resp.ServiceDetails for diagnostics                       │ │
-│  │                                                                            │ │
-│  │     if consecutiveFailureCount > threshold:                                │ │
-│  │         return HealthStatusOutage + FailureDetails{                        │ │
-│  │             ServiceDetails: resp.ServiceDetails  ◄── NEW                   │ │
-│  │         }                                                                  │ │
-│  │                                                       │                    │ │
-│  └───────────────────────────────────────────────────────│────────────────────┘ │
-│                                                          │                      │
-│                                                          ▼                      │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ AutoFailoverCluster Workflow                                               │ │
-│  │                                                                            │ │
-│  │   ✅ Log: "cellID unhealthy"                                               │ │
-│  │      • Service: history                                                    │ │
-│  │      • Failed hosts: [host1, host3]                                        │ │
-│  │      • Checks failed:                                                      │ │
-│  │        - PERSISTENCE_LATENCY: 850ms (threshold: 500ms)                     │ │
-│  │        - RPC_ERROR_RATIO: 0.15 (threshold: 0.10)                           │ │
-│  │                                     │                                      │ │
-│  │   ✅ Build HealthReport with:       │                                      │ │
-│  │      • Checks[]: detailed failures  ▼                                      │ │
-│  │      • FailoverAction: hard    Trigger Failover                            │ │
-│  │                                                                            │ │
-│  │   ✅ Persist to Cell.Health.HealthReport                                   │ │
-│  │                                                                            │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
-├──────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  temporal server                                                                 │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ Frontend: AdminHandler.DeepHealthCheck()                                   │ │
-│  │                                                                            │ │
-│  │   hosts = getAllHistoryHosts()                                             │ │
-│  │   hostDetails = []                                                         │ │
-│  │   for each host:                                                           │ │
-│  │       resp = historyClient.DeepHealthCheck(host)                           │ │
-│  │       hostDetails.append(resp)  ◄── NEW: collect details                   │ │
-│  │                                                                            │ │
-│  │   aggregateState = aggregate(hostDetails)                                  │ │
-│  │                           │                                                │ │
-│  │                           ▼                                                │ │
-│  │   return DeepHealthCheckResponse{                                          │ │
-│  │       State: aggregateState,           // backward compatible              │ │
-│  │       ServiceDetails: [{               // NEW: optional diagnostics        │ │
-│  │           Service: "history",                                              │ │
-│  │           State: NOT_SERVING,                                              │ │
-│  │           HostDetails: [{                                                  │ │
-│  │               Address: "host1:7234",                                       │ │
-│  │               State: NOT_SERVING,                                          │ │
-│  │               Checks: [{                                                   │ │
-│  │                   Type: PERSISTENCE_LATENCY,                               │ │
-│  │                   State: NOT_SERVING,                                      │ │
-│  │                   Value: 850.0,                                            │ │
-│  │                   Threshold: 500.0                                         │ │
-│  │               }]                                                           │ │
-│  │           }]                                                               │ │
-│  │       }]                                                                   │ │
-│  │   }                                                                        │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │ History: Handler.DeepHealthCheck()                                         │ │
-│  │                                                                            │ │
-│  │   checks = []                                                              │ │
-│  │   overallState = SERVING                                                   │ │
-│  │                                                                            │ │
-│  │   // Check 1: gRPC health (graceful shutdown)                              │ │
-│  │   checks.append({Type: GRPC_HEALTH, State: grpcState})                     │ │
-│  │   if grpcState != SERVING: overallState = DECLINED_SERVING                 │ │
-│  │                                                                            │ │
-│  │   // Check 2: RPC latency                                                  │ │
-│  │   latency = rpcHealthSignal.AverageLatency()                               │ │
-│  │   checks.append({Type: RPC_LATENCY, Value: latency, Threshold: t})         │ │
-│  │   if latency > threshold: overallState = NOT_SERVING                       │ │
-│  │                                                                            │ │
-│  │   // Check 3: RPC error ratio                                              │ │
-│  │   errRatio = rpcHealthSignal.ErrorRatio()                                  │ │
-│  │   checks.append({Type: RPC_ERROR_RATIO, Value: errRatio, Threshold: t})    │ │
-│  │   if errRatio > threshold: overallState = NOT_SERVING                      │ │
-│  │                                                                            │ │
-│  │   // Check 4: Persistence latency                                          │ │
-│  │   pLatency = persistenceSignal.AverageLatency()                            │ │
-│  │   checks.append({Type: PERSISTENCE_LATENCY, Value: pLatency, Threshold: t})│ │
-│  │   if pLatency > threshold: overallState = NOT_SERVING                      │ │
-│  │                                                                            │ │
-│  │   // Check 5: Persistence error ratio                                      │ │
-│  │   pErrRatio = persistenceSignal.ErrorRatio()                               │ │
-│  │   checks.append({Type: PERSISTENCE_ERROR_RATIO, Value: pErrRatio, ...})    │ │
-│  │   if pErrRatio > threshold: overallState = NOT_SERVING                     │ │
-│  │                                                                            │ │
-│  │   return DeepHealthCheckResponse{                                          │ │
-│  │       State: overallState,                                                 │ │
-│  │       Checks: checks  ◄── NEW: all check results with values               │ │
-│  │   }                                                                        │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-│                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                        PROPOSED: Fault Detection Flow                              │
+├───────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                    │
+│  saas-control-plane                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Activities.MonitorHealthStatus()                                              │  │
+│  │ [internal/workflows/temporal/activities.go:1577]                              │  │
+│  │                                                                               │  │
+│  │   every CheckIntervalInSeconds (default 10s):                                │  │
+│  │     resp, err = adminClient.DeepHealthCheck(ctx, &DeepHealthCheckRequest{})   │  │
+│  │     [activities.go:1617]                                                      │  │
+│  │                           │                                                   │  │
+│  │                           ▼                                                   │  │
+│  │     if resp.State == NOT_SERVING || DECLINED_SERVING:                        │  │
+│  │       consecutiveFailureCount++                                              │  │
+│  │       ✅ Store resp.Services for diagnostics  ◄── NEW                        │  │
+│  │                                                                               │  │
+│  │     if consecutiveFailureCount > MaxFailureCount:                            │  │
+│  │       return MonitorHealthStatusOutput{                                       │  │
+│  │         HealthStatus: HealthStatusOutage,                                     │  │
+│  │         FailureDetails: &MonitorHealthStatusFailureDetails{                   │  │
+│  │           ...,                                                                │  │
+│  │           ServiceDetails: resp.Services  ◄── NEW                              │  │
+│  │         }                                                                     │  │
+│  │       }  ────────────────────────────────────────────┐                       │  │
+│  └──────────────────────────────────────────────────────│───────────────────────┘  │
+│                                                          │                         │
+│                                                          ▼                         │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Workflows.AutoFailoverCluster()                                              │  │
+│  │ [internal/workflows/xdc/fault_detection.go:137]                              │  │
+│  │                                                                               │  │
+│  │   buildHealthReportFromFailureDetails(healthStatus.FailureDetails, now)       │  │
+│  │   [fault_detection.go:264]                                                    │  │
+│  │                                                                               │  │
+│  │   ✅ Log: "cellID unhealthy"                                                 │  │
+│  │      • Service: history                                                       │  │
+│  │      • Failed hosts: [host1, host3]                                           │  │
+│  │      • Checks failed:                                                         │  │
+│  │        - PERSISTENCE_LATENCY: 850ms (threshold: 500ms)                        │  │
+│  │        - RPC_ERROR_RATIO: 0.15 (threshold: 0.10)                              │  │
+│  │                                     │                                         │  │
+│  │   ✅ CreateCellHealthEvent(...)     │                                         │  │
+│  │   [fault_detection.go:267-281]      ▼                                         │  │
+│  │                                                                               │  │
+│  │   ✅ w.invokeCellEntity(UpdateCellHealthRequest{HealthReport: ...})           │  │
+│  │   [fault_detection.go:284-296]                                                │  │
+│  │                                                                               │  │
+│  │   ✅ Persist to Cell.Health.HealthReport                                      │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                    │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                    │
+│  temporal server                                                                   │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ AdminHandler.DeepHealthCheck()                                               │  │
+│  │ [service/frontend/admin_handler.go:260]                                      │  │
+│  │                                                                               │  │
+│  │   healthStatus, err = adh.historyHealthChecker.Check(ctx)                    │  │
+│  │   [admin_handler.go:266]                                                      │  │
+│  │                           │                                                   │  │
+│  │   ◄── CHANGE: also collect ServiceHealthDetail[] from Check()                │  │
+│  │                           │                                                   │  │
+│  │                           ▼                                                   │  │
+│  │   return &DeepHealthCheckResponse{                                           │  │
+│  │     State: healthStatus,                    // backward compatible            │  │
+│  │     Services: [{                            // NEW: optional diagnostics      │  │
+│  │       Service: "history",                                                     │  │
+│  │       State: NOT_SERVING,                                                     │  │
+│  │       Hosts: [{                                                               │  │
+│  │         Address: "host1:7234",                                                │  │
+│  │         State: NOT_SERVING,                                                   │  │
+│  │         Checks: [{                                                            │  │
+│  │           Type: PERSISTENCE_LATENCY,                                          │  │
+│  │           State: NOT_SERVING,                                                 │  │
+│  │           Value: 850.0,                                                       │  │
+│  │           Threshold: 500.0                                                    │  │
+│  │         }]                                                                    │  │
+│  │       }]                                                                      │  │
+│  │     }]                                                                        │  │
+│  │   }                                                                           │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                           │                                                        │
+│                           ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ healthCheckerImpl.Check()                                                    │  │
+│  │ [service/frontend/health_check.go:48]                                        │  │
+│  │                                                                               │  │
+│  │   resolver, err = h.membershipMonitor.GetResolver(h.serviceName)             │  │
+│  │   [health_check.go:49]                                                        │  │
+│  │                                                                               │  │
+│  │   hosts = resolver.AvailableMembers()                                        │  │
+│  │   [health_check.go:54]                                                        │  │
+│  │                                                                               │  │
+│  │   for each host (in parallel goroutines):                                    │  │
+│  │     resp, err = h.healthCheckFn(ctx, host.GetAddress())                      │  │
+│  │     [health_check.go:62]                                                      │  │
+│  │     └── healthCheckFn is a closure set in NewAdminHandler():                 │  │
+│  │         args.HistoryClient.DeepHealthCheck(ctx,                               │  │
+│  │           &DeepHealthCheckRequest{HostAddress: hostAddress})                  │  │
+│  │         [admin_handler.go:178]                                                │  │
+│  │                           │                                                   │  │
+│  │   ◄── CHANGE: collect resp into hostDetails[] instead of just counting       │  │
+│  │                           │                                                   │  │
+│  │                           ▼                                                   │  │
+│  │   Aggregate + return ServiceHealthDetail with per-host breakdown             │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                           │                                                        │
+│                           ▼                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Handler.DeepHealthCheck()  (per history host)                                │  │
+│  │ [service/history/handler.go:197]                                             │  │
+│  │                                                                               │  │
+│  │   checks = []                                                                │  │
+│  │   overallState = SERVING                                                     │  │
+│  │                                                                               │  │
+│  │   // Check 1: gRPC health (graceful shutdown / hysteresis)                   │  │
+│  │   status, err = h.healthServer.Check(ctx, &HealthCheckRequest{...})          │  │
+│  │   [handler.go:202]                                                            │  │
+│  │   checks.append({Type: GRPC_HEALTH, State: grpcState})                       │  │
+│  │   if status.Status != SERVING: overallState = DECLINED_SERVING               │  │
+│  │                                                                               │  │
+│  │   // Checks 2-3: h.checkHistoryHealthSignals()  [handler.go:211]             │  │
+│  │   // Check 2: h.historyHealthSignal.AverageLatency()  [handler.go:230]       │  │
+│  │   latency = historyHealthSignal.AverageLatency()                             │  │
+│  │   checks.append({Type: RPC_LATENCY, Value: latency, Threshold: t})           │  │
+│  │   if latency > config.HealthRPCLatencyFailure(): overallState = NOT_SERVING  │  │
+│  │                                                                               │  │
+│  │   // Check 3: h.historyHealthSignal.ErrorRatio()  [handler.go:236]           │  │
+│  │   errRatio = historyHealthSignal.ErrorRatio()                                │  │
+│  │   checks.append({Type: RPC_ERROR_RATIO, Value: errRatio, Threshold: t})      │  │
+│  │   if errRatio > config.HealthRPCErrorRatio(): overallState = NOT_SERVING     │  │
+│  │                                                                               │  │
+│  │   // Check 4: Persistence latency  [handler.go:216]                          │  │
+│  │   pLatency = persistenceHealthSignal.AverageLatency()                        │  │
+│  │   checks.append({Type: PERSISTENCE_LATENCY, Value: pLatency, Threshold: t})  │  │
+│  │   if pLatency > config.HealthPersistenceLatencyFailure(): NOT_SERVING        │  │
+│  │                                                                               │  │
+│  │   // Check 5: Persistence error ratio  [handler.go:219]                      │  │
+│  │   pErrRatio = persistenceHealthSignal.ErrorRatio()                           │  │
+│  │   checks.append({Type: PERSISTENCE_ERROR_RATIO, Value: pErrRatio, ...})      │  │
+│  │   if pErrRatio > config.HealthPersistenceErrorRatio(): NOT_SERVING           │  │
+│  │                                                                               │  │
+│  │   return DeepHealthCheckResponse{                                            │  │
+│  │     State: overallState,                                                      │  │
+│  │     Checks: checks  ◄── NEW: all check results with values                   │  │
+│  │   }                                                                           │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Proposed Proto Changes
